@@ -1,0 +1,10 @@
+[theme]
+base = "light"
+primaryColor = "#278BCB"
+backgroundColor = "#F1F7FC"
+secondaryBackgroundColor = "#EAF4FB"
+textColor = "#17243A"
+font = "serif"
+
+[server]
+showEmailPrompt = false
