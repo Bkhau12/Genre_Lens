@@ -1,8 +1,6 @@
-# Genre Lens 🎞️
+# Genre Lens
 
 An interactive Streamlit dashboard for exploring **which film genres people watch and rate, and how that changes over time**. It is built on MovieLens ratings and can add **critic review scores scraped from Wikipedia and Wikidata** for recent films (2020 to now), so trends continue past the end of the MovieLens data.
-
-*PDS301m project.*
 
 ![Genre Lens overview](docs/screenshot.png)
 
@@ -71,12 +69,11 @@ The app opens at http://localhost:8501.
 
 ### Included datasets
 
-| Folder | Ratings | Users | Films | Rating dates |
-|---|---:|---:|---:|---|
-| `ml-latest-small` | 100,836 | 610 | 9,742 | 1996-03-29 → 2018-09-24 |
-| `ml-32m-2020-2023-200k` | 200,000 | 24,773 | 14,043 | 2020-01-01 → 2023-10-13 |
-| `ml-32m-2000-2023-500k` | 500,000 | 100,947 | 17,025 | 2000-01-18 → 2023-10-13 |
-| `ml-32m-2000-2023-1m` | 1,000,000 | 120,637 | 22,324 | 1999-10-02 → 2023-10-13 |
+| Folder                    | Ratings   | Users   | Films  | Rating dates            |
+| `ml-latest-small`         | 100,836   | 610     | 9,742  | 1996-03-29 → 2018-09-24 |
+| `ml-32m-2020-2023-200k`   | 200,000   | 24,773  | 14,043 | 2020-01-01 → 2023-10-13 |
+| `ml-32m-2000-2023-500k`   | 500,000   | 100,947 | 17,025 | 2000-01-18 → 2023-10-13 |
+| `ml-32m-2000-2023-1m`     | 1,000,000 | 120,637 | 22,324 | 1999-10-02 → 2023-10-13 |
 
 The three `ml-32m-*` folders are random samples of [MovieLens 32M](https://grouplens.org/datasets/movielens/32m/), whose ratings end in October 2023. `ml-32m-2020-2023-200k` holds 200,000 ratings sampled from the 238,669 ratings dated 2020 or later in the 1m sample; pair it with the scraped reviews (**Full dataset**) to follow genres from 2020 to today.
 
@@ -139,12 +136,11 @@ Delete the `databases` folder to start fresh. Snapshots from older versions of t
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---|---|
-| `No module named 'bs4'` or `requests` | Stop the app and run `python -m pip install -r requirements.txt` in the same terminal and environment. |
-| `st.tabs() got an unexpected keyword argument 'on_change'` | Streamlit is too old: `python -m pip install -U "streamlit>=1.65"`. |
-| A scrape run finds 0 films | Check your internet connection. If Wikipedia changed its table layout, `parse_film_list_page` in `web_scraper.py` may need updating. |
-| Changes in a file seem to disappear | An editor tab with an older copy may have saved over it. Reload the file from disk before saving. |
+| Problem                                       | Fix                                                                                                    |
+| `No module named 'bs4'` or `requests`         | Stop the app and run `python -m pip install -r requirements.txt` in the same terminal and environment. |
+| `st.tabs() got an unexpected keyword argument 'on_change'` | Streamlit is too old: `python -m pip install -U "streamlit>=1.65"`.                       |
+| A scrape run finds 0 films | Check your internet connection. If Wikipedia changed its table layout, `parse_film_list_page` in `web_scraper.py` may need updating.                                                                                                                                                |
+| Changes in a file seem to disappear            | An editor tab with an older copy may have saved over it. Reload the file from disk before saving. |
 
 ## Data sources and credits
 
