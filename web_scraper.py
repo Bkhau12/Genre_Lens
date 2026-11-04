@@ -1,28 +1,27 @@
-"""Web scraping for the Genre Lens dashboard.
+"""Web scraping for the Genre Lens dashboard: critic review scores for recent films.
 
-Collects weekend box office number-one films from Wikipedia for many countries,
-then attaches genres to every film:
+1. Scrapes Wikipedia's yearly "List of American films of YEAR" pages (HTML tables, parsed with
+   BeautifulSoup) for every film's title and release date.
+2. Looks each film up on Wikidata for its genres and its Rotten Tomatoes / Metacritic scores.
+3. Converts each score to the same 0.5–5 scale as MovieLens ratings, so every score becomes one
+   review row (score, date, genres) that can be added straight onto your MovieLens data.
 
-1. If the film is in the active MovieLens catalog (title + year match), its
-   MovieLens genres are used, so scraped data and ratings share one genre list.
-2. Otherwise the film's genres are read from Wikidata and mapped onto the same
-   MovieLens genre names (Action, Comedy, Romance, ...).
-
-Pages are fetched through the public MediaWiki API with a descriptive
-User-Agent and a pause between requests, following Wikipedia's bot etiquette.
-Everything is stored in a separate SQLite file so imports of MovieLens
-snapshots are never touched.
+Requests go through the public MediaWiki / Wikidata APIs with a descriptive User-Agent and a pause
+between requests. Results are saved in their own SQLite file; your snapshots are never changed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
+import shutil
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import unicodedata
-from datetime import date as date_type, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date as date_type, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -39,35 +38,18 @@ except ImportError:  # app still opens; the sidebar explains how to install them
 INSTALL_HINT = "python -m pip install requests beautifulsoup4"
 
 ROOT = Path(__file__).resolve().parent
-SCRAPE_DIR = ROOT.parent / "02_Databases" / "web_scrape"
-SCRAPE_DB = SCRAPE_DIR / "box_office_weekends.sqlite3"
+SCRAPE_DIR = ROOT / "databases" / "web_scrape"          # inside the project; ignored by git
+SCRAPE_DB = SCRAPE_DIR / "critic_reviews.sqlite3"
+LEGACY_SCRAPE_DB = ROOT.parent / "02_Databases" / "web_scrape" / "critic_reviews.sqlite3"   # older app versions
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-USER_AGENT = "GenreLens/1.0 (PDS301m student project; educational box office analysis) python-requests"
+USER_AGENT = "GenreLens/1.0 (PDS301m student project; educational film review analysis) python-requests"
 REQUEST_PAUSE_SECONDS = 0.35
+FIRST_YEAR = 2020
 
-# Display name -> how Wikipedia names the country in "List of 2024 box office number-one films in ___".
-COUNTRIES = {
-    "United States": "the United States",
-    "United Kingdom": "the United Kingdom",
-    "France": "France",
-    "Germany": "Germany",
-    "Italy": "Italy",
-    "Spain": "Spain",
-    "Russia": "Russia",
-    "Japan": "Japan",
-    "South Korea": "South Korea",
-    "China": "China",
-    "Hong Kong": "Hong Kong",
-    "Taiwan": "Taiwan",
-    "Thailand": "Thailand",
-    "Australia": "Australia",
-    "New Zealand": "New Zealand",
-    "Mexico": "Mexico",
-    "Brazil": "Brazil",
-    "Argentina": "Argentina",
-}
+# Critic sites on Wikidata (qualifier P447 "review score by") -> how they appear as reviewers in the data.
+CRITIC_SOURCES = {"Q105584": ("Rotten Tomatoes critics", -1), "Q150248": ("Metacritic critics", -2)}
 
 MONTHS = {name: index for index, name in enumerate(
     ["january", "february", "march", "april", "may", "june", "july",
@@ -98,85 +80,8 @@ GENRE_KEYWORDS = [
     (r"\bwestern", ["Western"]),
 ]
 
+
 ARTICLES = {"the", "a", "an", "les", "la", "le", "l'", "il", "die", "der", "das", "el", "los", "las", "lo", "i", "gli"}
-
-
-# --------------------------------------------------------------------------- storage
-
-def _connect() -> sqlite3.Connection:
-    SCRAPE_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(SCRAPE_DB)
-    connection.executescript("""
-        CREATE TABLE IF NOT EXISTS weekends (
-            country TEXT NOT NULL,
-            weekend_date TEXT NOT NULL,
-            film_title TEXT NOT NULL,
-            wiki_title TEXT,
-            gross_text TEXT,
-            gross_value REAL,
-            source_page TEXT NOT NULL,
-            PRIMARY KEY (country, weekend_date)
-        );
-        CREATE TABLE IF NOT EXISTS films (
-            wiki_title TEXT PRIMARY KEY,
-            wikidata_id TEXT,
-            release_date TEXT,
-            wikidata_genres TEXT,
-            mapped_genres TEXT,
-            looked_up TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS scrape_log (
-            country TEXT NOT NULL,
-            year INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            rows INTEGER NOT NULL,
-            scraped_at TEXT NOT NULL,
-            PRIMARY KEY (country, year)
-        );
-        CREATE INDEX IF NOT EXISTS weekends_date_idx ON weekends(weekend_date);
-    """)
-    return connection
-
-
-def scrape_status() -> dict[str, object]:
-    """Summary of what has been scraped so far (safe to call when nothing exists yet)."""
-    if not SCRAPE_DB.exists():
-        return {"weekends": 0, "films": 0, "countries": 0, "first": None, "last": None, "scraped_at": None}
-    with _connect() as connection:
-        weekends, countries, first, last = connection.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT country), MIN(weekend_date), MAX(weekend_date) FROM weekends").fetchone()
-        films = connection.execute("SELECT COUNT(DISTINCT COALESCE(wiki_title, film_title)) FROM weekends").fetchone()[0]
-        scraped_at = connection.execute("SELECT MAX(scraped_at) FROM scrape_log").fetchone()[0]
-    return {"weekends": weekends, "films": films, "countries": countries, "first": first, "last": last,
-            "scraped_at": scraped_at}
-
-
-def coverage_table() -> pd.DataFrame:
-    if not SCRAPE_DB.exists():
-        return pd.DataFrame(columns=["Country", "Years found", "Years missing", "#1 weekends"])
-    with _connect() as connection:
-        log = pd.read_sql_query("SELECT country, year, status, rows FROM scrape_log", connection)
-    if log.empty:
-        return pd.DataFrame(columns=["Country", "Years found", "Years missing", "#1 weekends"])
-    table = log.groupby("country").agg(
-        found=("status", lambda values: int((values == "ok").sum())),
-        missing=("status", lambda values: int((values != "ok").sum())),
-        weekends=("rows", "sum"),
-    ).reset_index()
-    table.columns = ["Country", "Years found", "Years missing", "#1 weekends"]
-    return table.sort_values("#1 weekends", ascending=False)
-
-
-def load_box_office() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (weekends, films) data frames from the scrape database."""
-    if not SCRAPE_DB.exists():
-        return pd.DataFrame(), pd.DataFrame()
-    with _connect() as connection:
-        weekends = pd.read_sql_query("SELECT * FROM weekends", connection)
-        films = pd.read_sql_query("SELECT * FROM films", connection)
-    if not weekends.empty:
-        weekends["weekend_date"] = pd.to_datetime(weekends["weekend_date"])
-    return weekends, films
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -213,8 +118,6 @@ class _Client:
             return data
         raise RuntimeError(f"Gave up after repeated errors from {url}")
 
-
-# --------------------------------------------------------------------------- parsing helpers
 
 def _clean(text: str) -> str:
     text = re.sub(r"\[[^\]]*\]", "", text or "")          # footnote markers like [1] or [a]
@@ -268,103 +171,6 @@ def _expand_table(table) -> list[list]:
     return grid
 
 
-def parse_weekend_date(text: str, page_year: int) -> date_type | None:
-    """Parse 'January 7, 2024', '7 January 2024', 'January 5–7', '29 Dec – 1 Jan 2024' -> last day."""
-    text = _clean(text).lower().replace(",", " ")
-    text = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", text)
-    iso = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
-    if iso:
-        try:
-            return date_type(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-        except ValueError:
-            return None
-    tokens = re.findall(r"[a-z]+|\d+", text)
-    month = day = year = None
-    for token in tokens:
-        if token.isdigit():
-            value = int(token)
-            if len(token) == 4 and 1900 <= value <= 2100:
-                year = value
-            elif 1 <= value <= 31:
-                day = value
-        elif token in MONTHS:
-            month = MONTHS[token]
-    if month is None or day is None:
-        return None
-    year = year or page_year
-    try:
-        return date_type(year, month, day)
-    except ValueError:
-        return None
-
-
-def _parse_gross(text: str) -> float | None:
-    text = _clean(text).lower().replace(",", "")
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(billion|million|bn|m)?", text)
-    if not match:
-        return None
-    value = float(match.group(1))
-    unit = match.group(2)
-    if unit in ("billion", "bn"):
-        value *= 1e9
-    elif unit in ("million", "m"):
-        value *= 1e6
-    return value
-
-
-def _header_index(headers: list[str], *keywords: str) -> int | None:
-    for keyword in keywords:
-        for index, header in enumerate(headers):
-            if keyword in header:
-                return index
-    return None
-
-
-def parse_number_one_page(html: str, page_year: int) -> list[dict]:
-    """Extract weekend rows (date, film, link title, gross) from a box office number-one list page."""
-    soup = BeautifulSoup(html, "html.parser")
-    rows: list[dict] = []
-    for table in soup.select("table.wikitable"):
-        grid = _expand_table(table)
-        if len(grid) < 2:
-            continue
-        header_row = next((row for row in grid if all(cell.name == "th" for cell in row)), grid[0])
-        headers = [_clean(cell.get_text(" ")).lower() for cell in header_row]
-        film_col = _header_index(headers, "film", "title", "movie")
-        date_col = _header_index(headers, "weekend end", "end date", "date", "weekend", "week")
-        if film_col is None or date_col is None or film_col == date_col:
-            continue
-        gross_col = _header_index(headers, "weekend gross", "gross", "box office", "admissions", "revenue")
-        for row in grid:
-            if row is header_row or len(row) <= max(film_col, date_col):
-                continue
-            if all(cell.name == "th" for cell in row):
-                continue
-            weekend = parse_weekend_date(row[date_col].get_text(" "), page_year)
-            if weekend is None or abs(weekend.year - page_year) > 1:
-                continue
-            film_cell = row[film_col]
-            film_title = _clean(film_cell.get_text(" "))
-            if not film_title or film_title.lower() in {"n/a", "—", "-"}:
-                continue
-            link = next((anchor for anchor in film_cell.find_all("a", href=True)
-                         if anchor["href"].startswith("/wiki/") and ":" not in anchor["href"][6:]), None)
-            wiki_title = link.get("title") if link else None
-            gross_text = _clean(row[gross_col].get_text(" ")) if gross_col is not None and gross_col < len(row) else ""
-            rows.append({
-                "weekend_date": weekend.isoformat(),
-                "film_title": film_title,
-                "wiki_title": wiki_title,
-                "gross_text": gross_text,
-                "gross_value": _parse_gross(gross_text) if gross_text else None,
-            })
-    # one row per weekend (some pages repeat tables); keep the first occurrence
-    unique = {}
-    for row in rows:
-        unique.setdefault(row["weekend_date"], row)
-    return list(unique.values())
-
-
 def map_genre_labels(labels: list[str]) -> list[str]:
     genres: list[str] = []
     for label in labels:
@@ -377,10 +183,167 @@ def map_genre_labels(labels: list[str]) -> list[str]:
     return genres
 
 
+
+
+# --------------------------------------------------------------------------- storage
+
+def _connect() -> sqlite3.Connection:
+    SCRAPE_DIR.mkdir(parents=True, exist_ok=True)
+    if not SCRAPE_DB.exists() and LEGACY_SCRAPE_DB.exists():
+        shutil.copyfile(LEGACY_SCRAPE_DB, SCRAPE_DB)       # keep reviews scraped by an older version
+    connection = sqlite3.connect(SCRAPE_DB)
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS films (
+            wiki_title TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            release_date TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            wikidata_id TEXT,
+            wikidata_genres TEXT,
+            mapped_genres TEXT,
+            rt_raw TEXT,
+            rt_score REAL,
+            mc_raw TEXT,
+            mc_score REAL,
+            looked_up TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scrape_log (
+            year INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            films INTEGER NOT NULL,
+            scraped_at TEXT NOT NULL
+        );
+    """)
+    return connection
+
+
+def scrape_status() -> dict[str, object]:
+    """Summary of the saved scrape (safe to call before anything was scraped)."""
+    empty = {"films": 0, "reviews": 0, "pending": 0, "first": None, "last": None, "scraped_at": None}
+    if not SCRAPE_DB.exists() and not LEGACY_SCRAPE_DB.exists():
+        return empty
+    with _connect() as connection:
+        films, pending, first, last = connection.execute(
+            "SELECT COUNT(*), SUM(looked_up IS NULL AND release_date <= ?), MIN(release_date), MAX(release_date) FROM films",
+            (date_type.today().isoformat(),)).fetchone()
+        reviews = connection.execute("SELECT COUNT(rt_score) + COUNT(mc_score) FROM films").fetchone()[0]
+        scraped_at = connection.execute("SELECT MAX(scraped_at) FROM scrape_log").fetchone()[0]
+    return {"films": films or 0, "reviews": reviews or 0, "pending": pending or 0, "first": first, "last": last,
+            "scraped_at": scraped_at}
+
+
+def coverage_table() -> pd.DataFrame:
+    """Films found, looked up and reviewed, per release year."""
+    columns = ["Year", "Films found", "Looked up", "With critic score"]
+    if not SCRAPE_DB.exists() and not LEGACY_SCRAPE_DB.exists():
+        return pd.DataFrame(columns=columns)
+    with _connect() as connection:
+        table = pd.read_sql_query("""
+            SELECT year, COUNT(*), SUM(looked_up IS NOT NULL), SUM(rt_score IS NOT NULL OR mc_score IS NOT NULL)
+            FROM films GROUP BY year ORDER BY year DESC
+        """, connection)
+    table.columns = columns
+    return table
+
+
+# --------------------------------------------------------------------------- parsing
+
+def _cell_text(cell) -> str:
+    return _clean(cell.get_text(" "))
+
+
+def _month_of(text: str) -> int | None:
+    letters = re.sub(r"[^a-z]", "", text.lower())        # "J A N U A R Y" -> "january"
+    for name, number in MONTHS.items():
+        if letters.startswith(name):
+            return number
+    return None
+
+
+def parse_film_list_page(html: str, year: int) -> list[dict]:
+    """Films (title, link, release date) from a "List of American films of YEAR" page.
+
+    The release tables start with an "Opening" header spanning two columns: the month (one tall
+    merged cell per month) and the day (merged for films opening the same day).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    films: dict[str, dict] = {}
+    for table in soup.select("table.wikitable"):
+        grid = _expand_table(table)
+        if len(grid) < 2:
+            continue
+        header_row = next((row for row in grid if all(cell.name == "th" for cell in row)), grid[0])
+        headers = [_cell_text(cell).lower() for cell in header_row]
+        title_col = next((i for i, h in enumerate(headers) if h.startswith("title") or h == "film"), None)
+        opening = [i for i, h in enumerate(headers) if "opening" in h or "release" in h]
+        if title_col is None or not opening:
+            continue
+        month_col = opening[0]
+        day_col = opening[1] if len(opening) > 1 else None
+        last_month = None
+        for row in grid:
+            if row is header_row or len(row) <= title_col or all(cell.name == "th" for cell in row):
+                continue
+            month = _month_of(_cell_text(row[month_col])) or last_month
+            last_month = month
+            day_text = _cell_text(row[day_col]) if day_col is not None else _cell_text(row[month_col])
+            day_match = re.search(r"\b(\d{1,2})\b", day_text)
+            if not month or not day_match:
+                continue
+            try:
+                released = date_type(year, month, int(day_match.group(1)))
+            except ValueError:
+                continue
+            title_cell = row[title_col]
+            title = _cell_text(title_cell)
+            link = next((a for a in title_cell.find_all("a", href=True)
+                         if a["href"].startswith("/wiki/") and ":" not in a["href"][6:]), None)
+            if not title or not link:
+                continue                       # films without an article cannot be looked up
+            films.setdefault(link.get("title"), {"wiki_title": link.get("title"), "title": title,
+                                                 "release_date": released.isoformat(), "year": year})
+    return list(films.values())
+
+
+def score_to_five(value: str) -> float | None:
+    """'93%' -> 4.5, '85/100' -> 4.5, '7.4/10' -> 3.5 (rounded to MovieLens' 0.5 steps)."""
+    text = str(value).strip().replace(",", ".")
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*(%|/\s*(\d+(?:\.\d+)?))?$", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    if match.group(2) == "%":
+        scale = 100.0
+    elif match.group(3):
+        scale = float(match.group(3))
+    else:
+        scale = 100.0                          # Metacritic sometimes stores just "85"
+    if scale <= 0 or number > scale:
+        return None
+    five = math.floor(number / scale * 5 * 2 + 0.5) / 2     # round half up to the nearest 0.5
+    return min(5.0, max(0.5, five))
+
+
+def _pick_scores(claims: list[dict]) -> dict[str, str]:
+    """Latest Tomatometer (%) and Metascore (/100) per critic site from Wikidata P444 claims."""
+    picked: dict[str, str] = {}
+    for claim in claims:
+        value = claim.get("mainsnak", {}).get("datavalue", {}).get("value")
+        sources = [q.get("datavalue", {}).get("value", {}).get("id")
+                   for q in claim.get("qualifiers", {}).get("P447", [])]
+        for source in sources:
+            if source not in CRITIC_SOURCES or not isinstance(value, str):
+                continue
+            wanted = value.strip().endswith("%") if source == "Q105584" else not value.strip().endswith("%") and "/10" not in value.replace("/100", "")
+            if wanted:
+                picked[source] = value.strip()     # later claims are newer, so they win
+    return picked
+
+
 # --------------------------------------------------------------------------- scraping
 
-def _page_title(country_key: str, year: int) -> str:
-    return f"List of {year} box office number-one films in {COUNTRIES[country_key]}"
+def _page_title(year: int) -> str:
+    return f"List of American films of {year}"
 
 
 def _fetch_page_html(client: _Client, title: str) -> str | None:
@@ -390,84 +353,8 @@ def _fetch_page_html(client: _Client, title: str) -> str | None:
     return data.get("parse", {}).get("text")
 
 
-def _lookup_film_genres(client: _Client, connection: sqlite3.Connection, progress=None) -> int:
-    """Look up Wikidata genres for linked films that have not been looked up yet."""
-    titles = [row[0] for row in connection.execute("""
-        SELECT DISTINCT w.wiki_title FROM weekends w
-        LEFT JOIN films f ON f.wiki_title = w.wiki_title
-        WHERE w.wiki_title IS NOT NULL AND f.wiki_title IS NULL
-    """)]
-    looked_up = 0
-    for start in range(0, len(titles), 50):
-        batch = titles[start:start + 50]
-        if progress:
-            progress(f"Looking up genres for films {start + 1:,}–{start + len(batch):,} of {len(titles):,}…")
-        data = client.get_json(WIKIPEDIA_API, {"action": "query", "titles": "|".join(batch),
-                                               "prop": "pageprops", "ppprop": "wikibase_item", "redirects": 1})
-        query = data.get("query", {})
-        rename = {item["from"]: item["to"] for item in query.get("normalized", [])}
-        for item in query.get("redirects", []):
-            rename[item["from"]] = item["to"]
-        page_qids = {page.get("title"): page.get("pageprops", {}).get("wikibase_item") for page in query.get("pages", [])}
-
-        def resolve(title: str) -> str | None:
-            seen = 0
-            while title in rename and seen < 5:
-                title = rename[title]
-                seen += 1
-            return page_qids.get(title)
-
-        qids = {title: resolve(title) for title in batch}
-        wanted = sorted({qid for qid in qids.values() if qid})
-        claims: dict[str, dict] = {}
-        if wanted:
-            entity_data = client.get_json(WIKIDATA_API, {"action": "wbgetentities", "ids": "|".join(wanted), "props": "claims"})
-            for qid, entity in entity_data.get("entities", {}).items():
-                claims[qid] = entity.get("claims", {})
-
-        genre_ids: dict[str, list[str]] = {}
-        release_dates: dict[str, str | None] = {}
-        for qid, entity_claims in claims.items():
-            ids = []
-            for claim in entity_claims.get("P136", []):
-                value = claim.get("mainsnak", {}).get("datavalue", {}).get("value", {})
-                if isinstance(value, dict) and value.get("id"):
-                    ids.append(value["id"])
-            genre_ids[qid] = ids
-            dates = []
-            for claim in entity_claims.get("P577", []):
-                value = claim.get("mainsnak", {}).get("datavalue", {}).get("value", {})
-                if isinstance(value, dict) and value.get("time"):
-                    match = re.match(r"[+-](\d{4})-(\d{2})-(\d{2})", value["time"])
-                    if match:
-                        dates.append(f"{match.group(1)}-{max(1, int(match.group(2))):02d}-{max(1, int(match.group(3))):02d}")
-            release_dates[qid] = min(dates) if dates else None
-
-        all_genre_ids = sorted({gid for ids in genre_ids.values() for gid in ids})
-        labels: dict[str, str] = {}
-        for label_start in range(0, len(all_genre_ids), 50):
-            label_data = client.get_json(WIKIDATA_API, {"action": "wbgetentities", "props": "labels", "languages": "en",
-                                                        "ids": "|".join(all_genre_ids[label_start:label_start + 50])})
-            for gid, entity in label_data.get("entities", {}).items():
-                label = entity.get("labels", {}).get("en", {}).get("value")
-                if label:
-                    labels[gid] = label
-
-        now = datetime.now().isoformat(timespec="seconds")
-        records = []
-        for title in batch:
-            qid = qids.get(title)
-            genre_labels = [labels[gid] for gid in genre_ids.get(qid, []) if gid in labels] if qid else []
-            records.append((title, qid, release_dates.get(qid) if qid else None, "|".join(genre_labels),
-                            "|".join(map_genre_labels(genre_labels)), now))
-        connection.executemany("INSERT OR REPLACE INTO films VALUES (?, ?, ?, ?, ?, ?)", records)
-        connection.commit()
-        looked_up += len(batch)
-    return looked_up
-
-
 def _existing_pages(client: _Client, titles: list[str]) -> dict[str, str | None]:
-    """Check up to 50 titles per request; returns title -> resolved page title, or None if the page is missing."""
+    """Check up to 50 titles per request; returns title -> resolved page title, or None if missing."""
     found: dict[str, str | None] = {}
     for start in range(0, len(titles), 50):
         batch = titles[start:start + 50]
@@ -483,79 +370,132 @@ def _existing_pages(client: _Client, titles: list[str]) -> dict[str, str | None]
     return found
 
 
-def scrape_box_office(countries: list[str], first_year: int, last_year: int,
-                      refresh_existing: bool = False, progress=None, workers: int = 3) -> dict[str, int]:
-    """Scrape number-one weekend tables for each country and year, then look up film genres.
+def _lookup_films(client: _Client, connection: sqlite3.Connection, max_films: int, progress=None) -> dict[str, int]:
+    """Genres + critic scores from Wikidata for the newest films not looked up yet (at most max_films)."""
+    # Share the limit across the years: the newest film of every year first, then the next newest, ...
+    # Films not released yet are skipped (no reviews exist yet); they are checked once they come out.
+    titles = [row[0] for row in connection.execute("""
+        SELECT wiki_title FROM (
+            SELECT wiki_title, year, release_date,
+                   ROW_NUMBER() OVER (PARTITION BY year ORDER BY release_date DESC) AS turn
+            FROM films WHERE looked_up IS NULL AND release_date <= ?
+        ) ORDER BY turn, year DESC LIMIT ?
+    """, (date_type.today().isoformat(), max_films))]
+    done = {"looked_up": 0, "with_scores": 0}
+    for start in range(0, len(titles), 50):
+        batch = titles[start:start + 50]
+        if progress:
+            progress(f"Reading genres and critic scores: films {start + 1:,}–{start + len(batch):,} of {len(titles):,}",
+                     0.2 + 0.8 * start / max(len(titles), 1))
+        data = client.get_json(WIKIPEDIA_API, {"action": "query", "titles": "|".join(batch),
+                                               "prop": "pageprops", "ppprop": "wikibase_item", "redirects": 1})
+        query = data.get("query", {})
+        rename = {item["from"]: item["to"] for item in query.get("normalized", []) + query.get("redirects", [])}
+        page_qids = {page.get("title"): page.get("pageprops", {}).get("wikibase_item") for page in query.get("pages", [])}
+        qids = {}
+        for title in batch:
+            resolved, hops = title, 0
+            while resolved in rename and hops < 5:
+                resolved, hops = rename[resolved], hops + 1
+            qids[title] = page_qids.get(resolved)
+        wanted = sorted({qid for qid in qids.values() if qid})
+        claims: dict[str, dict] = {}
+        if wanted:
+            entity_data = client.get_json(WIKIDATA_API, {"action": "wbgetentities", "ids": "|".join(wanted), "props": "claims"})
+            claims = {qid: entity.get("claims", {}) for qid, entity in entity_data.get("entities", {}).items()}
+        genre_ids = {qid: [c.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id")
+                           for c in entity_claims.get("P136", [])] for qid, entity_claims in claims.items()}
+        all_genre_ids = sorted({gid for ids in genre_ids.values() for gid in ids if gid})
+        labels: dict[str, str] = {}
+        for label_start in range(0, len(all_genre_ids), 50):
+            label_data = client.get_json(WIKIDATA_API, {"action": "wbgetentities", "props": "labels", "languages": "en",
+                                                        "ids": "|".join(all_genre_ids[label_start:label_start + 50])})
+            for gid, entity in label_data.get("entities", {}).items():
+                label = entity.get("labels", {}).get("en", {}).get("value")
+                if label:
+                    labels[gid] = label
+        now = datetime.now().isoformat(timespec="seconds")
+        for title in batch:
+            qid = qids.get(title)
+            entity_claims = claims.get(qid, {}) if qid else {}
+            genre_labels = [labels[gid] for gid in genre_ids.get(qid, []) if gid in labels]
+            scores = _pick_scores(entity_claims.get("P444", []))
+            rt_raw, mc_raw = scores.get("Q105584"), scores.get("Q150248")
+            rt, mc = (score_to_five(rt_raw) if rt_raw else None), (score_to_five(mc_raw) if mc_raw else None)
+            connection.execute("""
+                UPDATE films SET wikidata_id = ?, wikidata_genres = ?, mapped_genres = ?, rt_raw = ?, rt_score = ?,
+                                 mc_raw = ?, mc_score = ?, looked_up = ? WHERE wiki_title = ?
+            """, (qid, "|".join(genre_labels), "|".join(map_genre_labels(genre_labels)), rt_raw, rt, mc_raw, mc, now, title))
+            done["looked_up"] += 1
+            done["with_scores"] += int(rt is not None or mc is not None)
+        connection.commit()                    # saved per batch, so Cancel keeps finished work
+    return done
 
-    Fast path: page existence is checked 50 titles per request, then only existing pages are
-    downloaded, a few at a time. Each page is saved as soon as it arrives, so stopping the run
-    (the Cancel button) keeps everything downloaded so far. Years already saved are skipped
-    unless ``refresh_existing`` is set; the two most recent years are always refreshed.
+
+def scrape_reviews(first_year: int, last_year: int, max_films: int = 300, refresh_existing: bool = False,
+                   progress=None, workers: int = 3) -> dict[str, int]:
+    """Scrape film lists for the years (newest first), then look up at most ``max_films`` new films.
+
+    Years already saved are skipped unless ``refresh_existing`` is set; the two most recent years
+    are always re-read so newly released films appear. Films looked up before are never repeated.
     """
     if not SCRAPING_AVAILABLE:
         raise RuntimeError(f"Scraping needs two extra packages. Stop the app, run `{INSTALL_HINT}` in the same terminal, then start it again")
     client = _Client(pause=0.1)
     connection = _connect()
     current_year = date_type.today().year
-    summary = {"pages": 0, "missing": 0, "errors": 0, "weekends": 0, "skipped": 0, "films": 0}
+    summary = {"pages": 0, "missing": 0, "errors": 0, "new_films": 0, "skipped": 0, "looked_up": 0, "with_scores": 0, "remaining": 0}
     executor = None
     try:
-        done = {(country, year) for country, year in connection.execute("SELECT country, year FROM scrape_log")}
-        jobs = []
-        for country in countries:
-            for year in range(first_year, last_year + 1):
-                if (country, year) in done and not refresh_existing and year < current_year - 1:
-                    summary["skipped"] += 1
-                else:
-                    jobs.append((country, year, _page_title(country, year)))
+        done = {year for (year,) in connection.execute("SELECT year FROM scrape_log WHERE status = 'ok'")}
+        years = [year for year in range(last_year, first_year - 1, -1)
+                 if refresh_existing or year not in done or year >= current_year - 1]
+        summary["skipped"] = (last_year - first_year + 1) - len(years)
         if progress:
-            progress(f"Checking which of {len(jobs):,} pages exist…", 0.02)
-        existing = _existing_pages(client, [title for _, _, title in jobs]) if jobs else {}
-
-        scraped_at = datetime.now().isoformat(timespec="seconds")
-        to_fetch = []
-        for country, year, title in jobs:
-            if existing.get(title) is None:
-                summary["missing"] += 1
-                connection.execute("INSERT OR REPLACE INTO scrape_log VALUES (?, ?, 'missing', 0, ?)", (country, year, scraped_at))
-            else:
-                to_fetch.append((country, year, title, existing[title]))
-        connection.commit()
-
+            progress(f"Checking film list pages for {len(years)} year(s)…", 0.02)
+        existing = _existing_pages(client, [_page_title(year) for year in years]) if years else {}
         local = threading.local()
 
-        def fetch(job):
+        def fetch(year):
             if not hasattr(local, "client"):
                 local.client = _Client(pause=0.1)
-            country, year, title, resolved = job
-            return job, parse_number_one_page(_fetch_page_html(local.client, resolved) or "", year)
+            return year, parse_film_list_page(_fetch_page_html(local.client, existing[_page_title(year)]) or "", year)
 
+        now = datetime.now().isoformat(timespec="seconds")
+        to_fetch = []
+        for year in years:
+            if existing.get(_page_title(year)):
+                to_fetch.append(year)
+            else:
+                summary["missing"] += 1
+                connection.execute("INSERT OR REPLACE INTO scrape_log VALUES (?, 'missing', 0, ?)", (year, now))
+        connection.commit()
         executor = ThreadPoolExecutor(max_workers=max(1, workers))
-        futures = [executor.submit(fetch, job) for job in to_fetch]
+        futures = [executor.submit(fetch, year) for year in to_fetch]
         for finished, future in enumerate(as_completed(futures), start=1):
             try:
-                (country, year, title, _), rows = future.result()
+                year, films = future.result()
             except Exception:
                 summary["errors"] += 1
                 continue
-            connection.executemany(
-                "INSERT OR REPLACE INTO weekends VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(country, row["weekend_date"], row["film_title"], row["wiki_title"], row["gross_text"],
-                  row["gross_value"], title) for row in rows])
-            connection.execute("INSERT OR REPLACE INTO scrape_log VALUES (?, ?, ?, ?, ?)",
-                               (country, year, "ok" if rows else "empty", len(rows), datetime.now().isoformat(timespec="seconds")))
+            before = connection.total_changes
+            connection.executemany("""
+                INSERT INTO films (wiki_title, title, release_date, year) VALUES (:wiki_title, :title, :release_date, :year)
+                ON CONFLICT(wiki_title) DO UPDATE SET title = excluded.title, release_date = excluded.release_date, year = excluded.year
+            """, films)
+            summary["new_films"] += connection.total_changes - before
+            connection.execute("INSERT OR REPLACE INTO scrape_log VALUES (?, ?, ?, ?)",
+                               (year, "ok" if films else "empty", len(films), datetime.now().isoformat(timespec="seconds")))
             connection.commit()
             summary["pages"] += 1
-            summary["weekends"] += len(rows)
             if progress:
-                progress(f"Downloaded {finished}/{len(to_fetch)} pages · {country} {year} · {summary['weekends']:,} weekends saved",
-                         0.05 + 0.85 * finished / max(len(to_fetch), 1))
+                progress(f"Film lists: {finished}/{len(to_fetch)} pages · {year}: {len(films):,} films", 0.05 + 0.15 * finished / max(len(to_fetch), 1))
         executor.shutdown(wait=True)
         executor = None
-        if progress:
-            progress("Looking up film genres on Wikidata…", 0.92)
-        summary["films"] = _lookup_film_genres(client, connection,
-                                               (lambda text: progress(text, 0.95)) if progress else None)
+        lookup = _lookup_films(client, connection, max_films, progress)
+        summary.update(lookup)
+        summary["remaining"] = connection.execute("SELECT COUNT(*) FROM films WHERE looked_up IS NULL AND release_date <= ?",
+                                                  (date_type.today().isoformat(),)).fetchone()[0]
     finally:
         if executor is not None:   # stopped early (Cancel): drop queued downloads, keep what is saved
             executor.shutdown(wait=False, cancel_futures=True)
@@ -596,168 +536,110 @@ def movielens_title_variants(title: str) -> tuple[list[str], int | None]:
     return variants, year
 
 
-def build_movielens_index(movies: pd.DataFrame) -> dict[str, list[tuple[int | None, str]]]:
-    """movies: columns title, genres ('Action|Comedy'). Returns normalized title -> [(year, genres)]."""
-    index: dict[str, list[tuple[int | None, str]]] = {}
-    for title, genres in zip(movies["title"], movies["genres"]):
+def build_movielens_index(movies: pd.DataFrame) -> dict[str, list[tuple[int | None, int, str, str]]]:
+    """Normalized title -> [(year, movie_id, title, genres)] for every film in a MovieLens catalog."""
+    index: dict[str, list[tuple[int | None, int, str, str]]] = {}
+    for movie_id, title, genres in zip(movies["movie_id"], movies["title"], movies["genres"]):
         variants, year = movielens_title_variants(title)
         for variant in variants:
-            index.setdefault(variant, []).append((year, genres))
+            index.setdefault(variant, []).append((year, int(movie_id), title, genres))
     return index
 
 
-def attach_genres(weekends: pd.DataFrame, films: pd.DataFrame,
-                  movielens_index: dict[str, list[tuple[int | None, str]]]) -> pd.DataFrame:
-    """Add 'genres' (pipe list) and 'genre_source' to weekend rows."""
-    if weekends.empty:
-        return weekends.assign(genres=pd.Series(dtype=str), genre_source=pd.Series(dtype=str))
-    film_genres = dict(zip(films["wiki_title"], films["mapped_genres"])) if not films.empty else {}
-    release_dates = dict(zip(films["wiki_title"], films["release_date"])) if not films.empty else {}
-    first_seen = weekends.groupby(weekends["wiki_title"].fillna(weekends["film_title"]))["weekend_date"].min()
-    genres_out, sources, release_out = [], [], []
-    cache: dict[tuple[str, int], tuple[str, str, int | None]] = {}
-    matched_years = []
-    wiki_titles = [value if isinstance(value, str) and value else None for value in weekends["wiki_title"]]
-    for film_title, wiki_title, weekend in zip(weekends["film_title"], wiki_titles, weekends["weekend_date"]):
-        key_title = wiki_title or film_title
-        year = int(first_seen.get(key_title, weekend).year)
-        cache_key = (key_title, year)
-        if cache_key not in cache:
-            match = None
-            for candidate in {normalize_title(film_title), normalize_title(wiki_title or "")} - {""}:
-                options = movielens_index.get(candidate, [])
-                close = [(genres, option_year) for option_year, genres in options if option_year is None or abs(option_year - year) <= 1]
-                if close:
-                    match = close[0]
-                    break
-            if match and match[0] != "(no genres listed)":
-                cache[cache_key] = (match[0], "MovieLens", match[1])
-            elif wiki_title and film_genres.get(wiki_title):
-                cache[cache_key] = (film_genres[wiki_title], "Wikidata", None)
-            else:
-                cache[cache_key] = ("", "Unknown", None)
-        genres, source, matched_year = cache[cache_key]
-        genres_out.append(genres)
-        sources.append(source)
-        matched_years.append(matched_year)
-        release_out.append(release_dates.get(wiki_title))
-    return weekends.assign(genres=genres_out, genre_source=sources, release_date=release_out, movielens_year=matched_years)
+def _match(index, title: str, wiki_title: str, year: int):
+    for candidate in {normalize_title(title), normalize_title(wiki_title)} - {""}:
+        for option_year, movie_id, ml_title, genres in index.get(candidate, []):
+            if option_year is None or abs(option_year - year) <= 1:
+                return movie_id, ml_title, genres
+    return None
 
 
-# --------------------------------------------------------------------------- box office as a dashboard data source
+# --------------------------------------------------------------------------- data for the dashboard
 
-def build_box_office_snapshot(movielens_db: str, countries: tuple[str, ...] = ()) -> str | None:
-    """Write the scraped weekends into a database with the same tables as a MovieLens snapshot.
+def build_review_view(movielens_db: str, include_mine: bool) -> str | None:
+    """A database in the MovieLens snapshot format holding the scraped critic reviews.
 
-    Each #1 weekend in one country becomes one row of ``ratings``: user_id is the country,
-    timestamp is the weekend end date and rating is empty (box office has no score). Films go into
-    ``movies``/``movie_genres`` with their genres, so every dashboard query works unchanged.
-    The file is rebuilt only when the scrape, the country choice or the MovieLens catalog changes.
+    include_mine=False -> only the scraped reviews ("Scraped reviews").
+    include_mine=True  -> a copy of your snapshot with the scraped reviews added ("Both").
+
+    Every critic score becomes one row of ``ratings``: the critic site is the reviewer (negative ids,
+    so they never clash with MovieLens users), the score is on the same 0.5–5 scale and the date is
+    the film's release date. Films already in your catalog keep their MovieLens id and genres, so the
+    two datasets add together cleanly; new films get new ids and their Wikidata genres.
     """
     if not SCRAPE_DB.exists():
         return None
-    import hashlib
     from data_store import movie_catalog
 
-    key = f"{movielens_db}|{','.join(sorted(countries))}|{SCRAPE_DB.stat().st_mtime}|v1"
-    path = SCRAPE_DIR / f"box_office_view_{hashlib.md5(key.encode()).hexdigest()[:12]}.sqlite3"
+    snapshot = Path(movielens_db)
+    key = f"{snapshot}|{snapshot.stat().st_mtime}|{include_mine}|{SCRAPE_DB.stat().st_mtime}|v2"
+    path = SCRAPE_DIR / f"review_view_{hashlib.md5(key.encode()).hexdigest()[:12]}.sqlite3"
     if path.exists():
         return str(path)
 
-    weekends, films = load_box_office()
-    if weekends.empty:
+    with _connect() as connection:
+        films = pd.read_sql_query("SELECT * FROM films WHERE rt_score IS NOT NULL OR mc_score IS NOT NULL", connection)
+    if films.empty:
         return None
-    if countries:
-        weekends = weekends[weekends["country"].isin(countries)]
-        if weekends.empty:
-            return None
-    weekends = attach_genres(weekends, films, build_movielens_index(movie_catalog(movielens_db)))
-    weekends = weekends.assign(film_key=weekends["wiki_title"].where(weekends["wiki_title"].notna(), weekends["film_title"]))
+    catalog = movie_catalog(movielens_db)
+    index = build_movielens_index(catalog)
+    next_id = int(catalog["movie_id"].max() or 0) + 1
 
-    film_rows, genre_rows, film_ids = [], [], {}
-    first_seen = weekends.groupby("film_key")["weekend_date"].min()
-    for film_key, group in weekends.groupby("film_key", sort=False):
-        first = group.iloc[0]
-        release_year = None
-        if isinstance(first["release_date"], str) and first["release_date"][:4].isdigit():
-            release_year = int(first["release_date"][:4])
-        elif pd.notna(first["movielens_year"]):
-            release_year = int(first["movielens_year"])
+    movie_rows, genre_rows, rating_rows, used_ids = [], [], [], set()
+    for film in films.itertuples(index=False):
+        release_year = int(film.release_date[:4])
+        matched = _match(index, film.title, film.wiki_title, release_year)
+        if matched:
+            movie_id, ml_title, ml_genres = matched
+            genres = [] if ml_genres == "(no genres listed)" else ml_genres.split("|")
+            title = ml_title
         else:
-            release_year = int(first_seen[film_key].year)
-        film_id = len(film_ids) + 1
-        film_ids[film_key] = film_id
-        film_rows.append((film_id, f"{first['film_title']} ({release_year})", release_year))
-        for genre in [genre for genre in str(first["genres"]).split("|") if genre]:
-            genre_rows.append((film_id, genre, release_year))
-
-    country_ids = {country: index for index, country in enumerate(COUNTRIES, start=1)}
-    for country in weekends["country"].unique():
-        country_ids.setdefault(country, len(country_ids) + 1)
-    rating_rows = [(country_ids[country], film_ids[film_key], None,
-                    int(pd.Timestamp(weekend).tz_localize("UTC").timestamp()) + 12 * 3600)
-                   for country, film_key, weekend in zip(weekends["country"], weekends["film_key"], weekends["weekend_date"])]
+            movie_id, next_id = next_id, next_id + 1
+            genres = [genre for genre in (film.mapped_genres or "").split("|") if genre]
+            title = f"{film.title} ({release_year})"
+        if movie_id not in used_ids and not (matched and include_mine):
+            movie_rows.append((movie_id, title, release_year))
+            genre_rows.extend((movie_id, genre, release_year) for genre in genres)
+        used_ids.add(movie_id)
+        timestamp = int(pd.Timestamp(film.release_date).tz_localize("UTC").timestamp()) + 12 * 3600
+        for score, (_, critic_id) in ((film.rt_score, CRITIC_SOURCES["Q105584"]), (film.mc_score, CRITIC_SOURCES["Q150248"])):
+            if score is not None and not pd.isna(score):
+                rating_rows.append((critic_id, movie_id, float(score), timestamp))
 
     building = Path(str(path) + ".building")
     building.unlink(missing_ok=True)
+    if include_mine:
+        shutil.copyfile(movielens_db, building)
     connection = sqlite3.connect(building)
     try:
-        connection.executescript("""
-            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE movies (movie_id INTEGER PRIMARY KEY, title TEXT NOT NULL, release_year INTEGER);
-            CREATE TABLE movie_genres (movie_id INTEGER NOT NULL, genre TEXT NOT NULL, release_year INTEGER,
-                                       PRIMARY KEY (movie_id, genre));
-            CREATE TABLE ratings (user_id INTEGER NOT NULL, movie_id INTEGER NOT NULL, rating REAL, timestamp INTEGER NOT NULL);
-            CREATE TABLE countries (user_id INTEGER PRIMARY KEY, country TEXT NOT NULL);
-        """)
-        connection.executemany("INSERT INTO movies VALUES (?, ?, ?)", film_rows)
-        connection.executemany("INSERT INTO movie_genres VALUES (?, ?, ?)", genre_rows)
+        if not include_mine:
+            connection.executescript("""
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE movies (movie_id INTEGER PRIMARY KEY, title TEXT NOT NULL, release_year INTEGER);
+                CREATE TABLE movie_genres (movie_id INTEGER NOT NULL, genre TEXT NOT NULL, release_year INTEGER,
+                                           PRIMARY KEY (movie_id, genre));
+                CREATE TABLE ratings (user_id INTEGER NOT NULL, movie_id INTEGER NOT NULL, rating REAL NOT NULL, timestamp INTEGER NOT NULL);
+            """)
+        connection.executemany("INSERT OR IGNORE INTO movies VALUES (?, ?, ?)", movie_rows)
+        connection.executemany("INSERT OR IGNORE INTO movie_genres VALUES (?, ?, ?)", genre_rows)
         connection.executemany("INSERT INTO ratings VALUES (?, ?, ?, ?)", rating_rows)
-        connection.executemany("INSERT INTO countries VALUES (?, ?)", [(cid, name) for name, cid in country_ids.items()])
-        connection.executescript("""
-            CREATE INDEX ratings_timestamp_idx ON ratings(timestamp);
-            CREATE INDEX ratings_movie_idx ON ratings(movie_id);
-            CREATE INDEX movie_genres_genre_idx ON movie_genres(genre);
-        """)
-        known = (weekends["genre_source"] != "Unknown").mean()
-        connection.executemany("INSERT INTO metadata VALUES (?, ?)", {
-            "name": "Box office #1 weekends (Wikipedia)",
-            "source": "Scraped from Wikipedia box office number-one lists",
+        if not include_mine:
+            connection.executescript("""
+                CREATE INDEX ratings_timestamp_idx ON ratings(timestamp);
+                CREATE INDEX ratings_movie_idx ON ratings(movie_id);
+                CREATE INDEX movie_genres_genre_idx ON movie_genres(genre);
+            """)
+        base_name = dict(connection.execute("SELECT key, value FROM metadata")).get("name", "Your data") if include_mine else ""
+        connection.executemany("INSERT OR REPLACE INTO metadata VALUES (?, ?)", {
+            "name": f"{base_name} + scraped reviews" if include_mine else "Scraped critic reviews",
+            "source": "Wikipedia film lists + Wikidata critic scores",
             "imported": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z"),
-            "ratings": str(len(rating_rows)),
-            "movies": str(len(film_rows)),
-            "genre_coverage": f"{known:.3f}",
+            "scraped_reviews": str(len(rating_rows)),
         }.items())
         connection.commit()
     finally:
         connection.close()
     building.replace(path)
-    old_views = sorted(SCRAPE_DIR.glob("box_office_view_*.sqlite3"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for old in old_views[8:]:
+    for old in sorted(SCRAPE_DIR.glob("review_view_*.sqlite3"), key=lambda item: item.stat().st_mtime, reverse=True)[6:]:
         old.unlink(missing_ok=True)
     return str(path)
-
-
-def scraped_countries() -> list[str]:
-    if not SCRAPE_DB.exists():
-        return []
-    with _connect() as connection:
-        return [row[0] for row in connection.execute("SELECT DISTINCT country FROM weekends ORDER BY country")]
-
-
-def country_breakdown(view_db: str, genre: str | None, start_date: str, end_date: str,
-                      release_years: tuple[int, int] | None = None, seasons: list[str] | None = None) -> pd.DataFrame:
-    """#1 weekends and distinct #1 films per country in a box office view database."""
-    from data_store import _where
-    where, params = _where(start_date, end_date, release_years, seasons or [], 0.0)
-    genre_join = " JOIN movie_genres g ON g.movie_id = r.movie_id" if genre else ""
-    if genre:
-        where += " AND g.genre = ?"
-        params.append(genre)
-    query = f"""
-        SELECT c.country, COUNT(*) AS rating_count, COUNT(DISTINCT r.movie_id) AS film_count
-        FROM ratings r JOIN movies m ON m.movie_id = r.movie_id JOIN countries c ON c.user_id = r.user_id{genre_join}
-        WHERE {where} GROUP BY c.country ORDER BY rating_count DESC
-    """
-    with sqlite3.connect(view_db) as connection:
-        return pd.read_sql_query(query, connection, params=params)

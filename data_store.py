@@ -15,8 +15,11 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
-DATABASE_DIR = ROOT.parent / "02_Databases" / "cache"
-EXCLUDED_DIRS = {".venv", "__pycache__", "data", ".git", "node_modules", "archive"}
+# Snapshots live inside the project (databases/ is ignored by git). Older versions of the app saved them in
+# ../02_Databases/cache; those are still listed so nothing has to be imported again.
+DATABASE_DIR = ROOT / "databases" / "cache"
+LEGACY_DATABASE_DIR = ROOT.parent / "02_Databases" / "cache"
+EXCLUDED_DIRS = {".venv", "__pycache__", "data", ".git", "node_modules", "archive", "databases"}
 
 
 def find_movie_datasets(root: Path = ROOT) -> list[dict[str, str]]:
@@ -40,7 +43,9 @@ def find_movie_datasets(root: Path = ROOT) -> list[dict[str, str]]:
 def list_snapshots() -> list[dict[str, str]]:
     DATABASE_DIR.mkdir(parents=True, exist_ok=True)
     snapshots = []
-    for path in sorted(DATABASE_DIR.rglob("*.sqlite3"), key=lambda item: item.stat().st_mtime, reverse=True):
+    folders = [DATABASE_DIR] + ([LEGACY_DATABASE_DIR] if LEGACY_DATABASE_DIR.is_dir() else [])
+    files = [path for folder in folders for path in folder.rglob("*.sqlite3")]
+    for path in sorted(files, key=lambda item: item.stat().st_mtime, reverse=True):
         try:
             with sqlite3.connect(path) as connection:
                 meta = dict(connection.execute("SELECT key, value FROM metadata"))
@@ -953,7 +958,7 @@ def movie_catalog(db_path: str) -> pd.DataFrame:
     """Titles with pipe-joined genres, used to match scraped box office films to this dataset."""
     with sqlite3.connect(db_path) as connection:
         return pd.read_sql_query("""
-            SELECT m.title, COALESCE(GROUP_CONCAT(g.genre, '|'), '(no genres listed)') AS genres
+            SELECT m.movie_id, m.title, COALESCE(GROUP_CONCAT(g.genre, '|'), '(no genres listed)') AS genres
             FROM movies m LEFT JOIN movie_genres g ON g.movie_id = m.movie_id
             GROUP BY m.movie_id
         """, connection)

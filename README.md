@@ -1,4 +1,4 @@
-# Genre Lens 
+# Genre Lens 🎞️
 
 An interactive Streamlit dashboard for exploring **which film genres people watch and rate, and how that changes over time**. It is built on MovieLens ratings and can add **critic review scores scraped from Wikipedia and Wikidata** for recent films (2020 to now), so trends continue past the end of the MovieLens data.
 
@@ -39,8 +39,8 @@ Requires **Python 3.10 or newer** (developed with 3.11).
 **Windows (PowerShell)**
 
 ```powershell
-git clone <your-repo-url>
-cd Movie_Rating
+git clone https://github.com/Bkhau12/Genre_Lens.git
+cd Genre_Lens
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
@@ -52,8 +52,8 @@ If PowerShell blocks `Activate.ps1`, run `Set-ExecutionPolicy -Scope CurrentUser
 **macOS / Linux**
 
 ```bash
-git clone <your-repo-url>
-cd Movie_Rating
+git clone https://github.com/Bkhau12/Genre_Lens.git
+cd Genre_Lens
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -151,5 +151,3 @@ Delete the `databases` folder to start fresh. Snapshots from older versions of t
 - **MovieLens** — F. Maxwell Harper and Joseph A. Konstan. 2015. *The MovieLens Datasets: History and Context.* ACM Transactions on Interactive Intelligent Systems 5, 4: 19:1–19:19. https://doi.org/10.1145/2827872. The data is redistributed under its original license (see the `README.txt` in each dataset folder): research use only, no commercial use, no endorsement by the University of Minnesota or GroupLens implied.
 - **Wikipedia** film lists — text available under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 - **Wikidata** genres and review scores — [CC0](https://creativecommons.org/publicdomain/zero/1.0/). Scores originate from Rotten Tomatoes and Metacritic.
-"# Genre_Lens" 
-"# Genre_Lens" 
